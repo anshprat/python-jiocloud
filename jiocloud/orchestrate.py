@@ -373,6 +373,117 @@ class DeploymentOrchestrator(object):
                 s_hash[s_type][role].append(h)
         return s_hash
 
+    # this is just here to make it easier to stub
+    # the file reading for testing
+    def get_instr_from_file(self, filename):
+        fp = file(filename)
+        return yaml.load(fp)
+
+    # uses enable_puppet to manage rolling upgrades
+    # TODO: use config_version keys eventually
+    def control_upgrade(self, version, filename=None, noop=False, data_type='config_state', key='enable_puppet'):
+        instructions = self.get_instr_from_file(filename) if filename else {}
+        cv = self.current_version()
+        if cv != version:
+            # we are just getting started
+            # 1. disable all hosts
+            print 'disabling all hosts'
+            self.manage_config(data_type, 'global', key, data=False, action='set')
+            # 2. trigger an update
+            self.trigger_update(version)
+        # 3. check instructions to figure out what keys to update
+        status = self.key_status_off_role(self.upgrade_status())
+        upgrade_rules = self.upgrade_list(instructions, status)
+        if noop:
+            return upgrade_rules
+        else:
+            return self.upgrade_from_data(upgrade_rules, data_type, key)
+
+    # take a set of host_data and a list of instructions
+    # return the set of hosts that can upgrade next
+    # instructions are of the form:
+    #   first: []
+    #       list of roles to be applied before everyone else
+    #   order_rules: {role:role}
+    #       rules about what roles depend on what other roles
+    #   rolling_rules: {global: N, role_r: N, host: N}
+    #       rules of how many should be applied at once, either globally, or for any role
+    # at the moment, these rules are applied in the following order:
+    #   1. iterate through all things listed as first, apply rolling rules for updates
+    #   2. apply order rules to figure out the order in which roles are applied
+    #   3. for each role that is applied, roll it out as specified by rolling rules
+    # NOTE: this assumes for now that the orders are applied per role, and then rolled out
+    # for each set of roles that is ready. At this time, there is no support for rolling
+    # out N at a time for each role before proceeding.
+    #
+    # TODO: there are some pretty serious locking issues here, this method cannot run more
+    # than once at the same time
+    #
+    def upgrade_list(self, instructions, status):
+        updates = {'roles': [], 'hosts': [], 'delete_hosts': []}
+        upgrading = status['upgrading']
+        rolling_rules = instructions.get('rolling_rules')
+        roles = rolling_rules and rolling_rules.get('roles')
+        global_num = rolling_rules and rolling_rules.get('global')
+        #print "Global number is: %s" % global_num
+        # iterate through all things that are pending
+        for role, hosts in status['pending'].iteritems():
+            #print "%s %s" % (role, hosts)
+            # for every role that is still pending,
+            # figure out if we need to update any hosts of that
+            # role
+            # figure out the rolling_upgrade number
+            num = roles and roles.get(role) or global_num
+            upgrading_num = 0 if upgrading.get(role) is None else len(upgrading[role])
+            if num is None or num >= len(hosts) + upgrading_num:
+                # if there is no rolling num, or num is greater than all
+                # pending and upgrading hosts, upgrade the entire role
+                updates['roles'].append(role)
+                # get all hosts of the specified role, and mark them as requirig deletion
+                # TODO I am not 100% sure on this, the idea is that we should delete all of the
+                # hosts keys that are set if we are upgrading the roles b/c those rules might
+                # conflict with the operation that has been decided upon, I am struggling a little
+                # bit to imagine all of the use cases related to this to determine if this might
+                # not meet a users expectations (ie: by deleting keys that they had intended to
+                # use to block a certain machine from running, I think the reality is that we
+                # need to differentiate between operational pauses (which should not be overridden
+                # and pauses that occur as a part of an upgrade procedure)
+                updates['delete_hosts'] += (status['upgrading'].get(role) or []) +\
+                                          (status['upgraded'].get(role) or []) +\
+                                          (status['pending'].get(role) or [])
+            elif upgrading_num < num:
+                num_hosts = num - upgrading_num
+                # append the first N num_hosts, sort to reduce race conditions
+                print "%s %s" % (updates['hosts'], sorted(hosts)[:num_hosts])
+                updates['hosts']+=sorted(hosts)[:num_hosts]
+            else:
+                print "No action to perform, %s of %s already upgrading" % (upgrading_num, num)
+        return updates
+
+    def update_upgrade_key(self, data_type, rule, name, key):
+        url = "/%s/%s/%s/%s" % (data_type, rule, name, key)
+        self.consul.kv.set(url, True)
+        return url
+
+    def delete_host_key(self, data_type, name, key):
+        url = "/%s/host/%s/%s" % (data_type, name, key)
+        self.consul.kv.__delitem__(url)
+        return url
+
+    # take a hash with keys: {role: [], hosts: []}
+    # TODO is there a reason to support a key to update global?
+    def upgrade_from_data(self, data, data_type, key):
+        updates = {'set': [], 'delete': []}
+        for host in data['hosts']:
+            updates['set'].append(self.update_upgrade_key(data_type, 'host', host, key))
+        for role in data['roles']:
+            updates['set'].append(self.update_upgrade_key(data_type, 'role', role, key))
+            # if we say that a role should be updated, does that mean that
+            # we should erase all host rules
+        for host in data['delete_hosts']:
+            updates['delete'].append(self.delete_host_key(data_type, host, key))
+        return updates
+
 def main(argv=sys.argv[1:]):
     parser = argparse.ArgumentParser(description='Utility for '
                                                  'orchestrating updates')
@@ -482,6 +593,12 @@ def main(argv=sys.argv[1:]):
     check_single_version_parser.add_argument('--verbose', '-v', action='store_true', help='Be verbose')
 
     upgrade_status = subparsers.add_parser('upgrade_status', help='show the current status of an upgrade')
+
+    upgrade_parser = subparsers.add_parser('upgrade', help='Perform a rolling upgrade')
+    upgrade_parser.add_argument('version', help='version to upgrade to')
+    upgrade_parser.add_argument('--filename', '-v', help='filename that hold upgrade instructions', default=None)
+    upgrade_parser.add_argument('--noop', action='store_true', help='Do not perform operations')
+
     args = parser.parse_args(argv)
 
     do = DeploymentOrchestrator(args.host, args.port)
@@ -541,6 +658,8 @@ def main(argv=sys.argv[1:]):
         return pending_update
     elif args.subcmd == 'debug_timeout':
         return not do.debug_timeout(args.version)
+    elif args.subcmd == 'upgrade':
+        print do.control_upgrade(args.version, args.filename, args.noop)
 
 if __name__ == '__main__':
     sys.exit(main(sys.argv[1:]))
