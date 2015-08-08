@@ -352,6 +352,9 @@ class OrchestrateTests(unittest.TestCase):
                               'pending': ['i3']
                               })
 
+    def test_control_upgrade(self):
+        return None
+
     def test_key_status_off_role(self):
         self.assertEquals(self.do.key_status_off_role({}), {})
         self.assertEquals(self.do.key_status_off_role(
@@ -362,3 +365,114 @@ class OrchestrateTests(unittest.TestCase):
             {'a': ['h1', 'h2', 'i1']}),
             {'a': {'h': ['h1','h2'], 'i': ['i1']}}
         )
+
+    def test_upgrade_list(self):
+        # when there is no data, return no data
+        status = {
+            'upgraded': {},
+            'upgrading': {},
+            'pending': {}
+        }
+        instructions = {}
+        self.assertEquals(self.do.upgrade_list(instructions, status), {
+            'roles': [],
+            'hosts': [],
+            'delete_hosts': []
+        })
+        # when there are no instructions, upgrade everyone
+        status = {
+            'upgraded': {'h': ['h1','h2']},
+            'upgrading': {'h': ['h3'], 'i': ['i1']},
+            'pending': {'i': ['i2'], 'j': ['j1']}
+        }
+        instructions = {}
+        self.assertEquals(self.do.upgrade_list(instructions, status), {
+            'hosts': [],
+            'roles': ['i', 'j'],
+            'delete_hosts': ['i1', 'i2', 'j1']
+        })
+        # if the total number to be upgraded is higher than the upgrading and pending, upgrade all
+        status = {
+            'upgraded': {'h': ['h1','h2']},
+            'upgrading': {'h': ['h3']},
+            'pending': {'h': ['h4', 'h5']}
+        }
+        instructions = {'rolling_rules': {'global': 5}}
+        self.assertEquals(self.do.upgrade_list(instructions, status), {
+            'hosts': [],
+            'roles': ['h'],
+            'delete_hosts': ['h3', 'h1', 'h2', 'h4', 'h5']
+        })
+        # when upgading is greater of equal to number, do nothing
+        status = {
+            'upgraded': {'h': ['h1','h2']},
+            'upgrading': {'h': ['h1', 'h2', 'h3']},
+            'pending': {'h': ['h4', 'h5']}
+        }
+        instructions = {'rolling_rules': {'global': 3}}
+        self.assertEquals(self.do.upgrade_list(instructions, status), {
+            'hosts': [],
+            'roles': [],
+            'delete_hosts': []
+        })
+        # if upgrading and upgrading + pending are less then num, upgrade some hosts
+        status = {
+            'upgraded': {'h': ['h1','h2']},
+            'upgrading': {'h': ['h1', 'h2', 'h3']},
+            'pending': {'h': ['h4', 'h5', 'h6', 'h7']}
+        }
+        instructions = {'rolling_rules': {'global': 5}}
+        self.assertEquals(self.do.upgrade_list(instructions, status), {
+            'hosts': ['h4', 'h5'],
+            'roles': [],
+            'delete_hosts': []
+        })
+        # with global and host specific overrides
+        status = {
+            'upgraded': {'h': ['h1','h2']},
+            'upgrading': {'h': ['h1'], 'i': ['i1']},
+            'pending': {'h': ['h2', 'h3', 'h4'], 'i': ['i2', 'i3']}
+        }
+        instructions = {'rolling_rules': {'global': 3, 'roles': {'i': 2}}, }
+        self.assertEquals(self.do.upgrade_list(instructions, status),{
+            'hosts': ['i2', 'h2', 'h3'],
+            'roles': [],
+            'delete_hosts': []
+        })
+        # with one host in pending state
+        status = {
+            'upgraded': {},
+            'upgrading': {},
+            'pending': {'h': ['h2']}
+        }
+        instructions = {'rolling_rules': {'global': 1}}
+        self.assertEquals(self.do.upgrade_list(instructions, status),{
+            'hosts': [],
+            'roles': ['h'],
+            'delete_hosts': ['h2']
+        })
+
+    def test_upgrade_from_data(self):
+        def consul_set_side_effect(*args, **kwargs):
+            return None
+        def consul_delete_side_effect(*args, **kwargs):
+            return None
+        with mock.patch('jiocloud.orchestrate.DeploymentOrchestrator.consul', new_callable=mock.PropertyMock) as consul:
+          data = {'hosts': [], 'roles': [], 'delete_hosts': []}
+          consul.return_value.kv.set.side_effect = consul_set_side_effect()
+          consul.return_value.kv.__delitem__.side_effect = consul_delete_side_effect()
+          self.assertEquals(self.do.upgrade_from_data(
+              data, 'config_state', 'enable_puppet'), {'set': [], 'delete': []}
+          )
+          data = {
+              'hosts': ['h1'],
+              'roles': ['h'],
+              'delete_hosts': ['h2']
+          }
+          self.assertEquals(self.do.upgrade_from_data(
+              data, 'config_state', 'enable_puppet'),
+              {
+                  'delete': ['/config_state/host/h2/enable_puppet'],
+                  'set': ['/config_state/host/h1/enable_puppet', '/config_state/role/h/enable_puppet']
+              }
+          )
