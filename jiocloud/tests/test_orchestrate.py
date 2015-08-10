@@ -291,5 +291,63 @@ class OrchestrateTests(unittest.TestCase):
 
             consul.return_value.kv.set.assert_called_with('/current_version', 'v673')
 
+    def test_hosts_at_versions(self):
 
+        def hosts_at_versions_with_args(*args, **kwargs):
+            if args[0] == '1':
+                return ['host1', 'host2']
+            if args[0] == '2':
+                return ['host3', 'host4']
+            return []
 
+        with nested(
+                mock.patch.object(self.do, 'running_versions'),
+                mock.patch.object(self.do, 'hosts_at_version')
+
+                ) as (running_versions, hosts_at_version):
+
+                    hosts_at_version.side_effect = hosts_at_versions_with_args
+
+                    running_versions.return_value = []
+                    self.assertEquals(self.do.hosts_at_versions(),{})
+
+                    running_versions.return_value = {'1', '2'}
+                    self.assertEquals(self.do.hosts_at_versions(),{'1':['host1', 'host2'], '2': ['host3', 'host4']})
+
+    def test_reformat_data(self):
+        data = {
+                   '/config_version/host/host1/key': 'data'
+               }
+        self.assertEquals(self.do.reformat_data(data), {'/config_version/host/host1': {'key': 'data'}})
+
+    def test_lookup_ordered_data_from_hash(self):
+        self.assertEquals(self.do.lookup_ordered_data_from_hash('config_version', ['host1'], {'config_version/host/host1':{'k': 'v'}}), {'host1': {'k': 'v'}})
+
+    def test_upgrade_status(self):
+        with nested(
+                mock.patch.object(self.do, 'current_version'),
+                mock.patch.object(self.do, 'hosts_at_versions'),
+                mock.patch.object(self.do, '_consul')
+                ) as (current_version, hosts_at_versions, consul):
+            current_version.return_value = '1'
+            # when there are no hosts
+            hosts_at_versions.return_value = {}
+            consul.kv.find.return_value = {}
+            self.assertEquals(self.do.upgrade_status(), {'pending': [], 'upgraded': [], 'upgrading': []})
+            # when there are hosts but no config rules
+            hosts_at_versions.return_value = {'1':['h1'], '2': ['h2']}
+            consul.kv.find.return_value = {}
+            self.assertEquals(self.do.upgrade_status(), {'pending': [], 'upgraded': ['h1'], 'upgrading': ['h2']})
+            # when nothing is in the pending state
+            hosts_at_versions.return_value = {'1':['h1'], '2': ['h2', 'i3'], '3': ['i4']}
+            config_state = {
+                'config_state/global/enable_puppet': False,
+                'config_state/role/h/enable_puppet': True,
+                'config_state/host/i4/enable_puppet': 'True',
+            }
+            consul.kv.find.return_value = config_state
+            self.assertEquals(self.do.upgrade_status(), {
+                              'upgraded': ['h1'],
+                              'upgrading': ['h2', 'i4'],
+                              'pending': ['i3']
+                              })

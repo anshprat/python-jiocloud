@@ -81,7 +81,7 @@ class DeploymentOrchestrator(object):
     ##
     def lookup_ordered_data(self, keytype, hostname, data=None):
         order = self.get_lookup_hash_from_hostname(hostname)
-        ret_dict= {}
+        ret_dict = {}
         for x in order:
             if data is None:
                 url = "/%s/%s%s/" % (keytype, x[0], x[1])
@@ -279,7 +279,6 @@ class DeploymentOrchestrator(object):
         result = self.lookup_ordered_data(data_type, hostname)
         try:
             ret = str(result['enable_puppet'])
-            print ret
             if 'rue' in ret:
                 return 0
             else:
@@ -297,6 +296,64 @@ class DeploymentOrchestrator(object):
 
     def set_config(self, key, value, scope, name, config_type="config_state", action="set"):
         return self.manage_config(config_type, scope, key, value, name, action)
+
+    # get a list of all hosts at all versions
+    def hosts_at_versions(self):
+        return {ver: self.hosts_at_version(ver) for ver in self.running_versions()}
+
+    # reformat data from the form stored in k/v to something that
+    # we can search against
+    def reformat_data(self, data={}):
+        munged_data = {}
+        for url, data in data.iteritems():
+            url_array = url.split('/')
+            key = url_array.pop()
+            new_url = '/'.join(url_array)
+            if new_url not in munged_data:
+                munged_data[new_url] = {}
+            munged_data[new_url][key] = data
+        return munged_data
+
+    def lookup_ordered_data_from_hash(self, keytype, hostnames=[], data={}):
+        hosts_dict = {}
+        for host in hostnames:
+            ret_dict = self.lookup_ordered_data(keytype, host, data)
+            hosts_dict[host] = ret_dict
+        return hosts_dict
+
+    #
+    #  track the progress of an upgrade:
+    #    what is the current version?
+    #    what hosts are set to that current version?
+    #    what hosts are currently upgrading?
+    #    what hosts have not even been signaled to upgrade?
+    #        this might be a little slow atm, but it's ok for now
+    def upgrade_status(self, data_type='config_state', pending_key='enable_puppet'):
+        # get current version
+        cv = self.current_version()
+        # get all hosts at all versons
+        hosts = self.hosts_at_versions()
+        if len(hosts) > 2:
+            print "Warning: more than 2 versions, this is weird..."
+        results = {}
+        # gets hosts that have upgraded
+        results['upgraded'] = hosts.pop(cv) if hosts.get(cv) else []
+        # get all hosts that are not upgraded, regardless of what their current version is
+        other_hosts = reduce(lambda x,y:x.union(y), hosts.values(), set())
+        munged_data = self.reformat_data(self.consul.kv.find("/%s/" % data_type))
+        res = self.lookup_ordered_data_from_hash(data_type,
+                                                 other_hosts,
+                                                 munged_data)
+        #print res
+        results['upgrading'] = []
+        results['pending'] = []
+        for host, keys in res.iteritems():
+            # assumed that value has to be the False string
+            if 'enable_puppet' in keys and str(keys['enable_puppet']) == 'False':
+                results['pending'].append(host)
+            else:
+                results['upgrading'].append(host)
+        return results
 
 def main(argv=sys.argv[1:]):
     parser = argparse.ArgumentParser(description='Utility for '
@@ -405,11 +462,15 @@ def main(argv=sys.argv[1:]):
     debug_timeout_parser = subparsers.add_parser('debug_timeout', help="Provides debug information when script gets  timed out")
     debug_timeout_parser.add_argument('version', help="Version to look for")
     check_single_version_parser.add_argument('--verbose', '-v', action='store_true', help='Be verbose')
+
+    upgrade_status = subparsers.add_parser('upgrade_status', help='show the current status of an upgrade')
     args = parser.parse_args(argv)
 
     do = DeploymentOrchestrator(args.host, args.port)
     if args.subcmd == 'trigger_update':
         do.trigger_update(args.version)
+    elif args.subcmd == 'upgrade_status':
+        print do.upgrade_status()
     elif args.subcmd == 'manage_config':
         print do.manage_config(args.config_type, args.scope, args.key, args.data, args.name, args.action)
     elif args.subcmd == 'host_data':
