@@ -358,6 +358,21 @@ class DeploymentOrchestrator(object):
                 results['upgrading'].append(host)
         return results
 
+    # take a list of pending hosts and hash it per role so that
+    # it's easier to perform orchestration operations against
+    def key_status_off_role(self, status):
+        s_hash = {}
+        for s_type, hosts in status.iteritems():
+            if s_hash.get(s_type) is None:
+                s_hash[s_type] = {}
+            for h in hosts:
+                m = self.get_host_match(h)
+                role = m.group(1)
+                if s_hash[s_type].get(role) is None:
+                    s_hash[s_type][role] = []
+                s_hash[s_type][role].append(h)
+        return s_hash
+
 def main(argv=sys.argv[1:]):
     parser = argparse.ArgumentParser(description='Utility for '
                                                  'orchestrating updates')
