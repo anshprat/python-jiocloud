@@ -351,3 +351,14 @@ class OrchestrateTests(unittest.TestCase):
                               'upgrading': ['h2', 'i4'],
                               'pending': ['i3']
                               })
+
+    def test_key_status_off_role(self):
+        self.assertEquals(self.do.key_status_off_role({}), {})
+        self.assertEquals(self.do.key_status_off_role(
+            {'a': []}),
+            {'a': {}}
+        )
+        self.assertEquals(self.do.key_status_off_role(
+            {'a': ['h1', 'h2', 'i1']}),
+            {'a': {'h': ['h1','h2'], 'i': ['i1']}}
+        )
