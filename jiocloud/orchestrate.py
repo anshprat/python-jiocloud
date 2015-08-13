@@ -53,19 +53,12 @@ class DeploymentOrchestrator(object):
     # add k/v for nodes,roles, or globally for either configuration state
     # or upgarde versions. This is intended to allow for different override levels
     # to control whether or not puppet runs or versions updates
-    def manage_config(self, action_type, scope, data, name=None, action="set"):
-        if not any(action_type in s for s in ['state', 'version']):
+    def manage_config(self, action_type, scope, key, data=None, name=None, action="set"):
+        if not any(action_type in s for s in ['config_state', 'config_version']):
             print "Invalid action type: %s" % action_type
             return False
         if not any(scope in s for s in ['global', 'role', 'host']):
             print "Invalid scope type: %s" % scope
-            return False
-        try:
-            cdata = data.split('=')
-            key = cdata[0]
-            data = cdata[1]
-        except IndexError:
-            print "data should be of form key=value"
             return False
         if name is None and scope != 'global':
                 print 'name must be passed if scope is not global'
@@ -76,9 +69,9 @@ class DeploymentOrchestrator(object):
             else:
                 name_url = '/' + name + '/' + key
         if action == 'set':
-            self.consul.kv.set("/config_%s/%s%s" % (action_type, scope, name_url), data)
+            self.consul.kv.set("/%s/%s%s" % (action_type, scope, name_url), data)
         elif action == 'delete':
-            self.consul.kv.__delitem__("/config_%s/%s%s" % (action_type, scope, name_url))
+            self.consul.kv.__delitem__("/%s/%s%s" % (action_type, scope, name_url))
         return data
 
     ##
@@ -86,22 +79,32 @@ class DeploymentOrchestrator(object):
     # Allows for multiple properties(example - enable_update, enable_puppet)
     # at various levels
     ##
-    def lookup_ordered_data(self, keytype, hostname):
+    def lookup_ordered_data(self, keytype, hostname, data=None):
         order = self.get_lookup_hash_from_hostname(hostname)
-        ret_dict= {}
+        ret_dict = {}
         for x in order:
-            url = "/%s/%s%s/" % (keytype, x[0], x[1])
+            if data is None:
+                url = "/%s/%s%s/" % (keytype, x[0], x[1])
+                result = self.consul.kv.find(url)
+            else:
+                # pass in data to save the amount of calls you have
+                # to make to the k/v store. Expects that the data has
+                # been retrieved via consul.kv.find("/%s/" % data_type)
+                # and been reformated via: self.reformat_data
+                url = "%s/%s%s" % (keytype, x[0], x[1])
+                result = data.get(url)
 #             print url
-            result = self.consul.kv.find(url)
             if result is not None:
 #                 print result
                 for k in result.keys():
                     ret_dict[k.rsplit('/',1)[-1]] = result[k]
-
         return ret_dict
 
+    def get_host_match(self, name):
+        return re.search('([a-z]+)(\d+)(-.*)?', name)
+
     def get_lookup_hash_from_hostname(self, name):
-        m = re.search('([a-z]+)(\d+)(-.*)?', name)
+        m = self.get_host_match(name)
         if m is None:
             print "Unexpected hostname format %s" % name
             return {}
@@ -266,11 +269,11 @@ class DeploymentOrchestrator(object):
             raise
 
     def debug_timeout(self, version):
-        self.get_failures(True) 
+        self.get_failures(True)
         if self.hosts_at_version(version):
             print "Registered hosts in consul with key name Running_Versions are:"
             for reg_host in self.hosts_at_version(version):
-                print "   %s" % reg_host 
+                print "   %s" % reg_host
         else:
             print "No Hosts registered!"
 
@@ -279,7 +282,6 @@ class DeploymentOrchestrator(object):
         result = self.lookup_ordered_data(data_type, hostname)
         try:
             ret = str(result['enable_puppet'])
-            print ret
             if 'rue' in ret:
                 return 0
             else:
@@ -288,25 +290,199 @@ class DeploymentOrchestrator(object):
             # If its not set, default is true
                 return 0
 
-    def check_config(self, config_name, scope, scope_param, config_type="state"):
-        if scope == 'global':
-            url = "/config_"+config_type+"/"+scope+"/"+config_name
-        else:
-            if scope_param is None:
-                print 'name must be passed if scope is not global'
-                return False
-            url = "/config_"+config_type+"/"+scope+"/"+scope_param+"/"+config_name
-        return self.consul.kv.find(url)
-
     ##
     # These two functions are wrapper around manage_config for some general
     # use cases. Leaving manage_config untouched to be used as raw consul editor
     ##
     def enable_puppet(self, value, scope, name, action):
-        return self.manage_config("state", scope, 'enable_puppet='+value, name, action)
+        return self.manage_config('config_state', scope, 'enable_puppet', value, name, action)
 
-    def set_config(self, value, scope, name, config_type="state", action="set"):
-        return self.manage_config(config_type, scope, value, name, action)
+    def set_config(self, key, value, scope, name, config_type="config_state", action="set"):
+        return self.manage_config(config_type, scope, key, value, name, action)
+
+    # get a list of all hosts at all versions
+    def hosts_at_versions(self):
+        return {ver: self.hosts_at_version(ver) for ver in self.running_versions()}
+
+    # reformat data from the form stored in k/v to something that
+    # we can search against
+    def reformat_data(self, data={}):
+        munged_data = {}
+        for url, data in data.iteritems():
+            url_array = url.split('/')
+            key = url_array.pop()
+            new_url = '/'.join(url_array)
+            if new_url not in munged_data:
+                munged_data[new_url] = {}
+            munged_data[new_url][key] = data
+        return munged_data
+
+    def lookup_ordered_data_from_hash(self, keytype, hostnames=[], data={}):
+        hosts_dict = {}
+        for host in hostnames:
+            ret_dict = self.lookup_ordered_data(keytype, host, data)
+            hosts_dict[host] = ret_dict
+        return hosts_dict
+
+    #
+    #  track the progress of an upgrade:
+    #    what is the current version?
+    #    what hosts are set to that current version?
+    #    what hosts are currently upgrading?
+    #    what hosts have not even been signaled to upgrade?
+    #        this might be a little slow atm, but it's ok for now
+    def upgrade_status(self, data_type='config_state', pending_key='enable_puppet'):
+        # get current version
+        cv = self.current_version()
+        # get all hosts at all versons
+        hosts = self.hosts_at_versions()
+        if len(hosts) > 2:
+            print "Warning: more than 2 versions, this is weird..."
+        results = {}
+        # gets hosts that have upgraded
+        results['upgraded'] = hosts.pop(cv) if hosts.get(cv) else []
+        # get all hosts that are not upgraded, regardless of what their current version is
+        other_hosts = reduce(lambda x,y:x.union(y), hosts.values(), set())
+        munged_data = self.reformat_data(self.consul.kv.find("/%s/" % data_type))
+        res = self.lookup_ordered_data_from_hash(data_type,
+                                                 other_hosts,
+                                                 munged_data)
+        #print res
+        results['upgrading'] = []
+        results['pending'] = []
+        for host, keys in res.iteritems():
+            # assumed that value has to be the False string
+            if 'enable_puppet' in keys and str(keys['enable_puppet']) == 'False':
+                results['pending'].append(host)
+            else:
+                results['upgrading'].append(host)
+        return results
+
+    # take a list of pending hosts and hash it per role so that
+    # it's easier to perform orchestration operations against
+    def key_status_off_role(self, status):
+        s_hash = {}
+        for s_type, hosts in status.iteritems():
+            if s_hash.get(s_type) is None:
+                s_hash[s_type] = {}
+            for h in hosts:
+                m = self.get_host_match(h)
+                role = m.group(1)
+                if s_hash[s_type].get(role) is None:
+                    s_hash[s_type][role] = []
+                s_hash[s_type][role].append(h)
+        return s_hash
+
+    # this is just here to make it easier to stub
+    # the file reading for testing
+    def get_instr_from_file(self, filename):
+        fp = file(filename)
+        return yaml.load(fp)
+
+    # uses enable_puppet to manage rolling upgrades
+    # TODO: use config_version keys eventually
+    def control_upgrade(self, version, filename=None, noop=False, data_type='config_state', key='enable_puppet'):
+        instructions = self.get_instr_from_file(filename) if filename else {}
+        cv = self.current_version()
+        if cv != version:
+            # we are just getting started
+            # 1. disable all hosts
+            print 'disabling all hosts'
+            self.manage_config(data_type, 'global', key, data=False, action='set')
+            # 2. trigger an update
+            self.trigger_update(version)
+        # 3. check instructions to figure out what keys to update
+        status = self.key_status_off_role(self.upgrade_status())
+        upgrade_rules = self.upgrade_list(instructions, status)
+        if noop:
+            return upgrade_rules
+        else:
+            return self.upgrade_from_data(upgrade_rules, data_type, key)
+
+    # take a set of host_data and a list of instructions
+    # return the set of hosts that can upgrade next
+    # instructions are of the form:
+    #   first: []
+    #       list of roles to be applied before everyone else
+    #   order_rules: {role:role}
+    #       rules about what roles depend on what other roles
+    #   rolling_rules: {global: N, role_r: N, host: N}
+    #       rules of how many should be applied at once, either globally, or for any role
+    # at the moment, these rules are applied in the following order:
+    #   1. iterate through all things listed as first, apply rolling rules for updates
+    #   2. apply order rules to figure out the order in which roles are applied
+    #   3. for each role that is applied, roll it out as specified by rolling rules
+    # NOTE: this assumes for now that the orders are applied per role, and then rolled out
+    # for each set of roles that is ready. At this time, there is no support for rolling
+    # out N at a time for each role before proceeding.
+    #
+    # TODO: there are some pretty serious locking issues here, this method cannot run more
+    # than once at the same time
+    #
+    def upgrade_list(self, instructions, status):
+        updates = {'roles': [], 'hosts': [], 'delete_hosts': []}
+        upgrading = status['upgrading']
+        rolling_rules = instructions.get('rolling_rules')
+        roles = rolling_rules and rolling_rules.get('roles')
+        global_num = rolling_rules and rolling_rules.get('global')
+        #print "Global number is: %s" % global_num
+        # iterate through all things that are pending
+        for role, hosts in status['pending'].iteritems():
+            #print "%s %s" % (role, hosts)
+            # for every role that is still pending,
+            # figure out if we need to update any hosts of that
+            # role
+            # figure out the rolling_upgrade number
+            num = roles and roles.get(role) or global_num
+            upgrading_num = 0 if upgrading.get(role) is None else len(upgrading[role])
+            if num is None or num >= len(hosts) + upgrading_num:
+                # if there is no rolling num, or num is greater than all
+                # pending and upgrading hosts, upgrade the entire role
+                updates['roles'].append(role)
+                # get all hosts of the specified role, and mark them as requirig deletion
+                # TODO I am not 100% sure on this, the idea is that we should delete all of the
+                # hosts keys that are set if we are upgrading the roles b/c those rules might
+                # conflict with the operation that has been decided upon, I am struggling a little
+                # bit to imagine all of the use cases related to this to determine if this might
+                # not meet a users expectations (ie: by deleting keys that they had intended to
+                # use to block a certain machine from running, I think the reality is that we
+                # need to differentiate between operational pauses (which should not be overridden
+                # and pauses that occur as a part of an upgrade procedure)
+                updates['delete_hosts'] += (status['upgrading'].get(role) or []) +\
+                                          (status['upgraded'].get(role) or []) +\
+                                          (status['pending'].get(role) or [])
+            elif upgrading_num < num:
+                num_hosts = num - upgrading_num
+                # append the first N num_hosts, sort to reduce race conditions
+                print "%s %s" % (updates['hosts'], sorted(hosts)[:num_hosts])
+                updates['hosts']+=sorted(hosts)[:num_hosts]
+            else:
+                print "No action to perform, %s of %s already upgrading" % (upgrading_num, num)
+        return updates
+
+    def update_upgrade_key(self, data_type, rule, name, key):
+        url = "/%s/%s/%s/%s" % (data_type, rule, name, key)
+        self.consul.kv.set(url, True)
+        return url
+
+    def delete_host_key(self, data_type, name, key):
+        url = "/%s/host/%s/%s" % (data_type, name, key)
+        self.consul.kv.__delitem__(url)
+        return url
+
+    # take a hash with keys: {role: [], hosts: []}
+    # TODO is there a reason to support a key to update global?
+    def upgrade_from_data(self, data, data_type, key):
+        updates = {'set': [], 'delete': []}
+        for host in data['hosts']:
+            updates['set'].append(self.update_upgrade_key(data_type, 'host', host, key))
+        for role in data['roles']:
+            updates['set'].append(self.update_upgrade_key(data_type, 'role', role, key))
+            # if we say that a role should be updated, does that mean that
+            # we should erase all host rules
+        for host in data['delete_hosts']:
+            updates['delete'].append(self.delete_host_key(data_type, host, key))
+        return updates
 
 def main(argv=sys.argv[1:]):
     parser = argparse.ArgumentParser(description='Utility for '
@@ -323,9 +499,11 @@ def main(argv=sys.argv[1:]):
     config_parser = subparsers.add_parser('manage_config',
                                           help='Update configuration action state for a fleet'
                                           )
-    config_parser.add_argument('config_type', type=str, help='Type of configuration to manage (version, state)')
+    config_parser.add_argument('config_type', type=str,
+                               help='Type of configuration to manage (config_version, config_state)')
     config_parser.add_argument('scope', type=str, help='Scope to which update effects (global, role, host)')
-    config_parser.add_argument('data', type=str, help='Data related to update in format key=value')
+    config_parser.add_argument('key', type=str, help='Key to set data for')
+    config_parser.add_argument('data', type=str, help='Data to set for specified key')
     config_parser.add_argument('--name', '-n', type=str, default=None, help='Name to apply updates to (host name, or role name, invalid for global)')
     config_parser.add_argument('--action', '-a', type=str, default="set", help='set or delete')
 
@@ -358,8 +536,9 @@ def main(argv=sys.argv[1:]):
 
     set_config_parser = subparsers.add_parser('set_config',
                                                    help='set/update/delete a config')
+    set_config_parser.add_argument('key', type=str, help='Key to set data for')
     set_config_parser.add_argument('value', type=str,
-                                      help='config_name=value')
+                                      help='Data to set for key')
     set_config_parser.add_argument('scope', type=str,
                                       help='scope - host / role / global')
     set_config_parser.add_argument('--action', '-a', type=str,
@@ -369,19 +548,7 @@ def main(argv=sys.argv[1:]):
                                        help='role / hostname to set data for')
     set_config_parser.add_argument('--config_type', '-c', type=str,
                                        default="state",
-                                       help='state / version')
-
-    check_config_parser = subparsers.add_parser('check_config',
-                                                   help='check a config value')
-    check_config_parser.add_argument('config_name', type=str,
-                                      help='config_name')
-    check_config_parser.add_argument('scope', type=str,
-                                      help='scope - host / role / global')
-    check_config_parser.add_argument('--name', '-n', type=str,
-                                       help='role / hostname to check data for')
-    check_config_parser.add_argument('--config_type', '-c', type=str,
-                                       default="state",
-                                       help='state / version')
+                                       help='config_state / config_version')
 
     current_version_parser = subparsers.add_parser('current_version',
                                                    help='Get available version')
@@ -424,23 +591,31 @@ def main(argv=sys.argv[1:]):
     debug_timeout_parser = subparsers.add_parser('debug_timeout', help="Provides debug information when script gets  timed out")
     debug_timeout_parser.add_argument('version', help="Version to look for")
     check_single_version_parser.add_argument('--verbose', '-v', action='store_true', help='Be verbose')
+
+    upgrade_status = subparsers.add_parser('upgrade_status', help='show the current status of an upgrade')
+
+    upgrade_parser = subparsers.add_parser('upgrade', help='Perform a rolling upgrade')
+    upgrade_parser.add_argument('version', help='version to upgrade to')
+    upgrade_parser.add_argument('--filename', '-v', help='filename that hold upgrade instructions', default=None)
+    upgrade_parser.add_argument('--noop', action='store_true', help='Do not perform operations')
+
     args = parser.parse_args(argv)
 
     do = DeploymentOrchestrator(args.host, args.port)
     if args.subcmd == 'trigger_update':
         do.trigger_update(args.version)
+    elif args.subcmd == 'upgrade_status':
+        print do.upgrade_status()
     elif args.subcmd == 'manage_config':
-        print do.manage_config(args.config_type, args.scope, args.data, args.name, args.action)
+        print do.manage_config(args.config_type, args.scope, args.key, args.data, args.name, args.action)
     elif args.subcmd == 'host_data':
         print do.lookup_ordered_data(args.data_type, args.hostname)
     elif args.subcmd == 'check_puppet':
         sys.exit(do.check_puppet(args.hostname))
     elif args.subcmd == 'enable_puppet':
         print do.enable_puppet(args.value, args.scope, args.name, args.action)
-    elif args.subcmd == 'check_config':
-        print do.check_config(args.config_name, args.scope, args.name, args.config_type)
     elif args.subcmd == 'set_config':
-        print do.set_config(args.value, args.scope, args.name, args.config_type, args.action)
+        print do.set_config(args.key, args.value, args.scope, args.name, args.config_type, args.action)
     elif args.subcmd == 'current_version':
         print do.current_version()
     elif args.subcmd == 'check_single_version':
@@ -483,6 +658,8 @@ def main(argv=sys.argv[1:]):
         return pending_update
     elif args.subcmd == 'debug_timeout':
         return not do.debug_timeout(args.version)
+    elif args.subcmd == 'upgrade':
+        print do.control_upgrade(args.version, args.filename, args.noop)
 
 if __name__ == '__main__':
     sys.exit(main(sys.argv[1:]))
