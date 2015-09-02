@@ -5,6 +5,7 @@ import os
 import sys
 import time
 from novaclient import client as novaclient
+from neutronclient.neutron import client as neutronclient
 
 """
 Various utils
@@ -20,8 +21,20 @@ def get_nova_creds_from_env():
     d['cacert'] = os.environ.get('OS_CACERT', None)
     return d
 
+def get_neutron_creds_from_env():
+    d = {}
+    d['username'] = os.environ['OS_USERNAME']
+    d['password'] = os.environ['OS_PASSWORD']
+    d['auth_url'] = os.environ['OS_AUTH_URL']
+    d['tenant_name'] = os.environ['OS_TENANT_NAME']
+    d['region_name'] = os.environ.get('OS_REGION_NAME')
+    return d
+
 def get_nova_client():
     return novaclient.Client("2", **get_nova_creds_from_env())
+
+def get_neutron_client():
+    return neutronclient.Client("2.0", **get_neutron_creds_from_env())
 
 def is_rfc1918(ip_string):
     return IPy.IP(ip_string).iptype() != "PUBLIC"

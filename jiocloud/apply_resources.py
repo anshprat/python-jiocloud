@@ -6,6 +6,8 @@ import utils
 import yaml
 from novaclient import client as novaclient
 from novaclient import exceptions as novacexceptions
+from neutronclient.neutron import client as neutronclient
+from neutronclient.common import exceptions as neutronexceptions
 import requests
 
 """
@@ -15,6 +17,7 @@ Parses a specification of nodes to install and makes it so
 class ApplyResources(object):
     def __init__(self):
         self.nova_client = None
+        self.neutron_client = None
         self._images = {}
         self._flavors = {}
 
@@ -30,6 +33,11 @@ class ApplyResources(object):
         if not self.nova_client:
             self.nova_client = utils.get_nova_client()
         return self.nova_client
+
+    def get_neutron_client(self):
+        if not self.neutron_client:
+            self.neutron_client = utils.get_neutron_client()
+        return self.neutron_client
 
     def get_existing_servers(self, project_tag=None, attr_name='name'):
         """
@@ -167,6 +175,7 @@ class ApplyResources(object):
 
     def delete_servers(self, project_tag):
         nova_client = self.get_nova_client()
+        neutron_client = self.get_neutron_client()
         # The whole call is already in a retry
         # The below retries are redundant but help to keep 
         # the retry loops smaller
@@ -178,22 +187,33 @@ class ApplyResources(object):
                 print e
         while True:
             try:
-                ip_to_server_map = {ip.instance_id: ip for ip in nova_client.floating_ips.list()}
+                floatingips = neutron_client.list_floatingips()
+                ip_to_port_map = {str(fip['port_id']): str(fip['floating_ip_address']) for fip in  floatingips['floatingips']}
+                try:
+                    ip_to_port_map.__delitem__('None')
+                except KeyError:
+                    pass
+                ip_to_server_map = {(neutron_client.show_port(port))['port']['device_id']:fip for port,fip in ip_to_port_map.iteritems()}
                 break
             except (requests.ConnectionError, novacexceptions.ClientException) as e:
                 print e
+            except  neutronexceptions.NeutronClientException as e:
+                # There are many fips without port_id, need separate cleanup for them (manual?)
+                pass
         ips_to_delete = set()
         for uuid in servers:
             print "Deleting uuid: %s"%(uuid)
             server = nova_client.servers.get(uuid)
             if uuid in ip_to_server_map:
                 ip = ip_to_server_map[uuid]
-                server.remove_floating_ip(ip.ip)
+#                 import pdb
+#                 pdb.set_trace()
+                server.remove_floating_ip(ip)
                 ips_to_delete.add(ip)
             self.delete_server(uuid)
 
         for ip in ips_to_delete:
-            print "Deleting floating ip: %s" % (ip.ip,)
+            print "Deleting floating ip: %s" % (ip)
             ip.delete()
 
 
